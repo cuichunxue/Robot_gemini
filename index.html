@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Robot Arm Simulation</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #1a1a2e; color: white; font-family: sans-serif; }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            padding: 10px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 4px;
+            pointer-events: none;
+            user-select: none;
+        }
+    </style>
+    <!-- Three.js CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- OrbitControls (カメラ操作用) -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+    <div id="info">
+        状態: <span id="status">初期化中...</span><br>
+        <small>マウスドラッグで視点移動・ホイールでズーム</small>
+    </div>
+
+    <script>
+        // --- 設定定数 ---
+        const ARM_1_LEN = 12; // 上腕の長さ
+        const ARM_2_LEN = 10; // 前腕の長さ
+        const BASE_HEIGHT = 4; // 台座の高さ（ピボットポイントまでの高さ）
+        
+        // 作業位置
+        const PICK_POS = new THREE.Vector3(-12, 2, 12); // ピックアップ位置
+        const PLACE_POS = new THREE.Vector3(12, 0, -8); // スタック位置基準
+        const STACK_OFFSET = 4.2; // ブロックの高さ + マージン
+
+        // --- グローバル変数 ---
+        let scene, camera, renderer, controls;
+        let robot = {}; // ロボットのパーツを格納
+        let blocks = []; // 生成されたブロック
+        let currentBlock = null; // 現在運んでいるブロック
+        let stackHeight = 0;
+        
+        // ターゲット座標（IK用）
+        let targetPos = new THREE.Vector3(10, 10, 10);
+        let currentPos = new THREE.Vector3(10, 10, 10); // 現在の手先位置（スムージング用）
+        let gripperOpen = true;
+        let gripperGap = 1.0; // クローの開き具合
+
+        // アニメーション制御
+        let state = 'SPAWN';
+        let stateTimer = 0;
+        const statusEl = document.getElementById('status');
+
+        init();
+        animate();
+
+        function init() {
+            // 1. シーンセットアップ
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a2e);
+            scene.fog = new THREE.Fog(0x1a1a2e, 20, 100);
+
+            // 2. カメラ
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(30, 25, 30);
+            camera.lookAt(0, 10, 0);
+
+            // 3. レンダラー
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. コントロール
+            if (THREE.OrbitControls) {
+                controls = new THREE.OrbitControls(camera, renderer.domElement);
+                controls.enableDamping = true;
+            }
+
+            // 5. ライティング
+            const ambientLight = new THREE.AmbientLight(0x404040, 1.5); // 環境光
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+            dirLight.position.set(10, 30, 20);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            scene.add(dirLight);
+
+            // 6. オブジェクト生成
+            createEnvironment();
+            createRobot();
+
+            // ウィンドウリサイズ対応
+            window.addEventListener('resize', onWindowResize, false);
+
+            // ロジック開始
+            startLogicLoop();
+        }
+
+        function createEnvironment() {
+            // 床
+            const planeGeometry = new THREE.PlaneGeometry(100, 100);
+            const planeMaterial = new THREE.MeshStandardMaterial({ 
+                color: 0x16213e, 
+                roughness: 0.8,
+                metalness: 0.2
+            });
+            const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+            plane.rotation.x = -Math.PI / 2;
+            plane.receiveShadow = true;
+            scene.add(plane);
+
+            // グリッドヘルパー
+            const gridHelper = new THREE.GridHelper(100, 20, 0x333333, 0x222222);
+            scene.add(gridHelper);
+
+            // ピックアップ位置のマーカー
+            const markerGeo = new THREE.RingGeometry(2, 2.5, 32);
+            const markerMat = new THREE.MeshBasicMaterial({ color: 0x4cc9f0, transparent: true, opacity: 0.3, side: THREE.DoubleSide });
+            const pickMarker = new THREE.Mesh(markerGeo, markerMat);
+            pickMarker.position.copy(PICK_POS);
+            pickMarker.position.y = 0.05;
+            pickMarker.rotation.x = -Math.PI / 2;
+            scene.add(pickMarker);
+
+            // スタック位置のマーカー
+            const placeMarker = new THREE.Mesh(markerGeo, new THREE.MeshBasicMaterial({ color: 0xe94560, transparent: true, opacity: 0.3, side: THREE.DoubleSide }));
+            placeMarker.position.copy(PLACE_POS);
+            placeMarker.position.y = 0.05;
+            placeMarker.rotation.x = -Math.PI / 2;
+            scene.add(placeMarker);
+        }
+
+        function createRobot() {
+            const materialGrey = new THREE.MeshStandardMaterial({ color: 0xa2a8d3, roughness: 0.3, metalness: 0.8 });
+            const materialRed = new THREE.MeshStandardMaterial({ color: 0xe94560, roughness: 0.4 });
+            const materialDark = new THREE.MeshStandardMaterial({ color: 0x333333 });
+
+            // 1. 土台 (固定)
+            const baseGeo = new THREE.CylinderGeometry(3, 4, 2, 32);
+            const baseMesh = new THREE.Mesh(baseGeo, materialDark);
+            baseMesh.position.y = 1;
+            baseMesh.castShadow = true;
+            baseMesh.receiveShadow = true;
+            scene.add(baseMesh);
+
+            // 2. 旋回タレット (Y軸回転)
+            const turretGroup = new THREE.Group();
+            turretGroup.position.y = 2; // 土台の上
+            scene.add(turretGroup);
+            robot.turret = turretGroup;
+
+            const turretGeo = new THREE.CylinderGeometry(2, 2, 2, 16);
+            const turretMesh = new THREE.Mesh(turretGeo, materialRed);
+            turretMesh.position.y = 1; // グループ原点から上に
+            turretMesh.castShadow = true;
+            turretGroup.add(turretMesh);
+
+            // 3. 上腕 (Upper Arm) - タレットに取り付け
+            // ピボットポイントはタレットの中心、高さBASE_HEIGHT付近
+            const arm1Group = new THREE.Group();
+            arm1Group.position.y = 2; // タレットの上部
+            turretGroup.add(arm1Group);
+            robot.arm1 = arm1Group;
+
+            // 上腕の可視メッシュ
+            const arm1Geo = new THREE.BoxGeometry(1.5, ARM_1_LEN, 1.5);
+            const arm1Mesh = new THREE.Mesh(arm1Geo, materialGrey);
+            arm1Mesh.position.y = ARM_1_LEN / 2; // ピボットから上に伸ばす
+            arm1Mesh.castShadow = true;
+            arm1Group.add(arm1Mesh);
+
+            // ジョイント装飾
+            const joint1Geo = new THREE.CylinderGeometry(1.2, 1.2, 2.5, 16);
+            const joint1Mesh = new THREE.Mesh(joint1Geo, materialDark);
+            joint1Mesh.rotation.z = Math.PI / 2;
+            arm1Group.add(joint1Mesh);
+
+            // 4. 前腕 (Forearm) - 上腕の先端に取り付け
+            const arm2Group = new THREE.Group();
+            arm2Group.position.y = ARM_1_LEN; // 上腕の長さ分上へ
+            arm1Group.add(arm2Group);
+            robot.arm2 = arm2Group;
+
+            const arm2Geo = new THREE.BoxGeometry(1.2, ARM_2_LEN, 1.2);
+            const arm2Mesh = new THREE.Mesh(arm2Geo, materialGrey);
+            arm2Mesh.position.y = ARM_2_LEN / 2;
+            arm2Mesh.castShadow = true;
+            arm2Group.add(arm2Mesh);
+
+            // 肘ジョイント装飾
+            const joint2Mesh = new THREE.Mesh(joint1Geo, materialDark);
+            joint2Mesh.rotation.z = Math.PI / 2;
+            arm2Group.add(joint2Mesh);
+
+            // 5. 手首/ハンド (Wrist)
+            const wristGroup = new THREE.Group();
+            wristGroup.position.y = ARM_2_LEN;
+            arm2Group.add(wristGroup);
+            robot.wrist = wristGroup;
+
+            // ハンドのベース
+            const handBaseGeo = new THREE.BoxGeometry(2, 0.5, 3);
+            const handBase = new THREE.Mesh(handBaseGeo, materialDark);
+            wristGroup.add(handBase);
+
+            // クロー (指)
+            robot.clawL = new THREE.Mesh(new THREE.BoxGeometry(0.5, 2, 2), materialRed);
+            robot.clawL.position.set(-0.8, -1, 0);
+            wristGroup.add(robot.clawL);
+
+            robot.clawR = new THREE.Mesh(new THREE.BoxGeometry(0.5, 2, 2), materialRed);
+            robot.clawR.position.set(0.8, -1, 0);
+            wristGroup.add(robot.clawR);
+        }
+
+        // --- IK Solver (逆運動学) ---
+        // (x, y, z) のターゲットに対してロボットの各関節角度を計算して適用する
+        function solveIK(targetX, targetY, targetZ) {
+            // 1. 台座の回転 (Theta 0)
+            // Z軸とX軸から角度を求める
+            const theta0 = Math.atan2(targetX, targetZ);
+
+            // 2. 平面距離と高さの計算
+            // ロボットの中心からの水平距離
+            const hDist = Math.sqrt(targetX*targetX + targetZ*targetZ);
+            // ターゲットの高さ (台座ピボットからの相対高さ)
+            const vDist = targetY - BASE_HEIGHT;
+
+            // 3. 2リンクIKの計算
+            const dist = Math.sqrt(hDist*hDist + vDist*vDist);
+            
+            // 届かない場合のクランプ
+            const maxReach = ARM_1_LEN + ARM_2_LEN - 0.1;
+            let effHDist = hDist;
+            let effVDist = vDist;
+
+            if (dist > maxReach) {
+                const ratio = maxReach / dist;
+                effHDist *= ratio;
+                effVDist *= ratio;
+            }
+
+            // 余弦定理
+            const a = ARM_1_LEN;
+            const b = ARM_2_LEN;
+            const c = Math.sqrt(effHDist*effHDist + effVDist*effVDist);
+
+            // 肘の角度 (内角)
+            // cos(C) = (a^2 + b^2 - c^2) / (2ab)
+            let cosElbow = (a*a + b*b - c*c) / (2*a*b);
+            // 数値誤差で範囲外にならないようにクランプ
+            cosElbow = Math.max(-1, Math.min(1, cosElbow));
+            const angleElbowRaw = Math.acos(cosElbow);
+
+            // 肩の角度
+            const angleToTarget = Math.atan2(effVDist, effHDist);
+            // cos(A) = (c^2 + a^2 - b^2) / (2ca)
+            let cosShoulder = (c*c + a*a - b*b) / (2*c*a);
+            cosShoulder = Math.max(-1, Math.min(1, cosShoulder));
+            const angleShoulderOffset = Math.acos(cosShoulder);
+            
+            // 実際の肩の角度 (水平から)
+            const theta1 = (Math.PI / 2) - (angleToTarget + angleShoulderOffset);
+            
+            // 実際の肘の角度 (上腕から)
+            const theta2 = Math.PI - angleElbowRaw;
+
+            // 4. 手首の角度 (常に下を向くように補正)
+            // 肩 + 肘 + 手首 = 180度 (垂直下向き)
+            // Three.jsの回転方向を考慮して調整
+            // ここでのtheta1, theta2は幾何学的な角度。Three.jsのRotationに変換する
+            
+            return {
+                turret: theta0,
+                arm1: theta1,  // 前に倒すのがPositive X回転とする
+                arm2: theta2,
+                wrist: -(theta1 + theta2) // 手首を水平/下向きに維持するための逆回転
+            };
+        }
+
+        // --- ロジック制御 ---
+
+        function spawnBlock() {
+            const geometry = new THREE.BoxGeometry(4, 4, 4);
+            const hue = Math.random();
+            const material = new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(hue, 0.7, 0.5) });
+            const block = new THREE.Mesh(geometry, material);
+            
+            // 影の設定
+            block.castShadow = true;
+            block.receiveShadow = true;
+
+            // 初期位置（空から降ってくる演出用）
+            block.position.copy(PICK_POS);
+            block.position.y += 20; 
+            
+            scene.add(block);
+            blocks.push(block);
+            return block;
+        }
+
+        async function wait(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        async function startLogicLoop() {
+            while (true) {
+                // 1. ブロック生成
+                statusEl.innerText = "ブロック生成";
+                let block = spawnBlock();
+                
+                // 落下アニメーション
+                const startY = block.position.y;
+                const endY = 2; // 床の上(Box height 4 / 2)
+                for(let i=0; i<=1; i+=0.05) {
+                    block.position.y = THREE.MathUtils.lerp(startY, endY, i);
+                    await wait(16);
+                }
+
+                // 2. ピック位置へ移動 (上空)
+                statusEl.innerText = "移動中 (ピックアップ)";
+                gripperOpen = true;
+                targetPos.set(PICK_POS.x, PICK_POS.y + 10, PICK_POS.z); // ホバー
+                await wait(1000);
+
+                // 3. 掴みに行く
+                targetPos.set(PICK_POS.x, 5, PICK_POS.z); // 掴む高さ (手首がブロックの中心にくるように)
+                await wait(800);
+
+                // 4. 掴む
+                statusEl.innerText = "キャッチ";
+                gripperOpen = false;
+                await wait(300);
+                
+                // Parent変更: Scene -> Wrist
+                // これによりアームと一緒に動くようになる
+                robot.wrist.attach(block);
+                currentBlock = block;
+
+                // 5. 持ち上げ
+                targetPos.set(PICK_POS.x, 15, PICK_POS.z);
+                await wait(600);
+
+                // 6. スタック位置へ移動 (上空)
+                statusEl.innerText = "移動中 (運搬)";
+                // 積み上げ高さを計算
+                const stackY = STACK_OFFSET * stackHeight + 2; // +2はブロックの半径
+                
+                targetPos.set(PLACE_POS.x, Math.max(15, stackY + 10), PLACE_POS.z);
+                await wait(1000);
+
+                // 7. 配置位置へ降下
+                statusEl.innerText = "配置";
+                targetPos.set(PLACE_POS.x, stackY + 3.5, PLACE_POS.z); // 少し高めから離す
+                await wait(800);
+
+                // 8. 離す
+                gripperOpen = true;
+                scene.attach(block); // Parent変更: Wrist -> Scene
+                
+                // 物理的なスナップ（少し整列させる）
+                block.rotation.set(0, 0, 0);
+                block.position.set(PLACE_POS.x, stackY, PLACE_POS.z);
+                
+                currentBlock = null;
+                stackHeight++;
+                await wait(500);
+
+                // 9. 退避
+                statusEl.innerText = "待機位置へ";
+                targetPos.set(0, 15, 0); // 中央上空へ
+                await wait(800);
+
+                // リセット判定
+                if (stackHeight >= 5) {
+                    statusEl.innerText = "満杯 - リセット中";
+                    await wait(500);
+                    
+                    // ブロックを消去
+                    for(let b of blocks) {
+                        // 崩れるアニメーション（簡易）
+                        b.position.x += (Math.random()-0.5)*5;
+                        b.position.z += (Math.random()-0.5)*5;
+                    }
+                    await wait(500);
+                    for(let b of blocks) {
+                        scene.remove(b);
+                        if(b.geometry) b.geometry.dispose();
+                    }
+                    blocks = [];
+                    stackHeight = 0;
+                    await wait(500);
+                }
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // 1. 現在位置のスムージング (Lerp)
+            currentPos.lerp(targetPos, 0.05);
+
+            // 2. IK計算
+            const angles = solveIK(currentPos.x, currentPos.y, currentPos.z);
+
+            // 3. ロボットへの適用 (スムージング付き)
+            if (robot.turret) {
+                // 台座回転
+                robot.turret.rotation.y = angles.turret;
+                
+                // アーム回転 (X軸回転として適用)
+                robot.arm1.rotation.x = angles.arm1;
+                robot.arm2.rotation.x = angles.arm2;
+                
+                // 手首回転 (ワールド座標で下を向くように)
+                robot.wrist.rotation.x = angles.wrist;
+            }
+
+            // 4. グリッパーアニメーション
+            if (robot.clawL && robot.clawR) {
+                const targetGap = gripperOpen ? 0.8 : 0.25;
+                gripperGap += (targetGap - gripperGap) * 0.2;
+                robot.clawL.position.x = -gripperGap;
+                robot.clawR.position.x = gripperGap;
+            }
+
+            // コントロール更新
+            if (controls) controls.update();
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
+
